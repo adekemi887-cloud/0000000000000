@@ -1,0 +1,15 @@
+{
+  "name": "pinterest-feed-backend",
+  "version": "1.0.0",
+  "description": "Backend for Cloudinary Pinterest Feed",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cloudinary": "^2.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}
