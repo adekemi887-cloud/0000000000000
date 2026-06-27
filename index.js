@@ -4,12 +4,9 @@ const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 
 const app = express();
-
-// Set the port for Render (Render automatically provides process.env.PORT)
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors()); // Allows your front-end to connect to this server
+app.use(cors());
 app.use(express.json());
 
 // --- HARDCODED CLOUDINARY CONFIGURATION ---
@@ -19,7 +16,6 @@ cloudinary.config({
     api_secret: 'BZuIO8S5N9JxNB_zTDRRbRf6j2U'
 });
 
-// Configure Multer to keep uploaded files in memory (Required for Render)
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
@@ -27,20 +23,17 @@ const upload = multer({ storage: storage });
 const JSONBIN_MASTER_KEY = "$2a$10$d3I8WtKsHo9rGbNCZ..7meshIr35VlIuJazxNWQCaHfesns.oNZhq";
 const JSONBIN_BIN_ID = "6a3d75f6f5f4af5e293079fc";
 
-// Helper Function: Fetch Chat DB
 async function getChatDB() {
     const response = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`, {
         headers: { 'X-Master-Key': JSONBIN_MASTER_KEY }
     });
     const data = await response.json();
     let record = data.record || {};
-    // Fallbacks just in case the database is empty
     if (!record.users) record.users = [];
     if (!record.messages) record.messages = [];
     return record;
 }
 
-// Helper Function: Save Chat DB
 async function saveChatDB(record) {
     await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`, {
         method: 'PUT',
@@ -52,26 +45,18 @@ async function saveChatDB(record) {
     });
 }
 
-
-// ==========================================
-// ROUTES
-// ==========================================
-
 // 1. Health Check Route
 app.get('/', (req, res) => {
     res.send('✅ Cloudinary Node.js Server + Chat API is Running!');
 });
 
-// ==========================================
-// PINTEREST FEED ROUTES (Untouched)
-// ==========================================
-
-// 2. Fetch Feed & Search Route
+// 2. Fetch Feed & Search Route (FIXED: Isolated content and optimized loading)
 app.get('/api/feed', async (req, res) => {
     try {
         const searchTag = req.query.search;
-        let expression = 'resource_type:image';
-        
+        // FIX: Only fetch images explicitly uploaded by this app (Stops random Cloudinary images)
+        let expression = 'resource_type:image AND tags="pinterest_app"';
+
         if (searchTag) {
             expression += ` AND tags="${searchTag}"`;
         }
@@ -83,24 +68,31 @@ app.get('/api/feed', async (req, res) => {
             .with_field('tags')
             .execute();
         
-        res.json({ success: true, pins: result.resources });
+        // FIX: Inject Cloudinary optimization parameters for speed (w_400,q_auto,f_auto)
+        const optimizedPins = result.resources.map(pin => {
+            const optimizedUrl = pin.secure_url.replace('/upload/', '/upload/w_400,q_auto,f_auto/');
+            return { ...pin, secure_url: optimizedUrl };
+        });
+        
+        res.json({ success: true, pins: optimizedPins });
     } catch (error) {
         console.error("Error fetching feed:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 });
 
-// 3. Upload Image Route
+// 3. Upload Image Route (FIXED: Tagging uploads properly)
 app.post('/api/upload', upload.single('image'), (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ success: false, message: 'No image provided.' });
         }
-        
+
         const tag = req.body.tag ? req.body.tag.toLowerCase() : 'untagged';
         
+        // FIX: Add 'pinterest_app' tag so we own this content and don't pull random files
         const uploadStream = cloudinary.uploader.upload_stream(
-            { tags: [tag] },
+            { tags: ['pinterest_app', tag] },
             (error, result) => {
                 if (error) {
                     console.error("Cloudinary upload error:", error);
@@ -118,18 +110,12 @@ app.post('/api/upload', upload.single('image'), (req, res) => {
     }
 });
 
-
-// ==========================================
-// CHAT & USER API ROUTES (New Features)
-// ==========================================
-
-// 4. Get Entire Chat Database (Messages and Users)
+// 4. Get Entire Chat Database
 app.get('/api/chat/db', async (req, res) => {
     try {
         const db = await getChatDB();
         res.json({ success: true, data: db });
     } catch (error) {
-        console.error("Error fetching chat DB:", error);
         res.status(500).json({ success: false, message: 'Failed to fetch chat database.' });
     }
 });
@@ -141,16 +127,12 @@ app.post('/api/chat/user', async (req, res) => {
         if (!email) return res.status(400).json({ success: false, message: "Email required." });
 
         let db = await getChatDB();
-        
-        // If user doesn't exist, add them and save
         if (!db.users.includes(email)) {
             db.users.push(email);
             await saveChatDB(db);
         }
-        
         res.json({ success: true, users: db.users });
     } catch (error) {
-        console.error("Error adding user:", error);
         res.status(500).json({ success: false, message: 'Failed to register user.' });
     }
 });
@@ -164,25 +146,15 @@ app.post('/api/chat/message', async (req, res) => {
         }
 
         let db = await getChatDB();
-        
-        // Append the new message to the database
-        db.messages.push({ 
-            sender, 
-            receiver, 
-            text, 
-            timestamp: timestamp || Date.now() 
-        });
-        
+        db.messages.push({ sender, receiver, text, timestamp: timestamp || Date.now() });
         await saveChatDB(db);
 
         res.json({ success: true, message: "Message sent successfully!" });
     } catch (error) {
-        console.error("Error sending message:", error);
         res.status(500).json({ success: false, message: 'Failed to send message.' });
     }
 });
 
-// Start the server
 app.listen(PORT, () => {
     console.log(`🚀 Server is running on port ${PORT}`);
 });
