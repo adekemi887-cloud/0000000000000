@@ -2,159 +2,132 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
+const http = require('http');
+const { Server } = require('socket.io');
+const { Readable } = require('stream');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
 
+// Middleware
 app.use(cors());
 app.use(express.json());
 
-// --- HARDCODED CLOUDINARY CONFIGURATION ---
+// Hardcoded Cloudinary Configuration
 cloudinary.config({
     cloud_name: 'dyhhksvot',
     api_key: '843162796934642',
     api_secret: 'BZuIO8S5N9JxNB_zTDRRbRf6j2U'
 });
 
+// Configure Multer
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// --- CHAT & AUTH DATABASE CONFIG (JSONBIN) ---
-const JSONBIN_MASTER_KEY = "$2a$10$d3I8WtKsHo9rGbNCZ..7meshIr35VlIuJazxNWQCaHfesns.oNZhq";
-const JSONBIN_BIN_ID = "6a3d75f6f5f4af5e293079fc";
+let feedData = [];
 
-async function getChatDB() {
-    const response = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`, {
-        headers: { 'X-Master-Key': JSONBIN_MASTER_KEY }
-    });
-    const data = await response.json();
-    let record = data.record || {};
-    if (!record.users) record.users = [];
-    if (!record.messages) record.messages = [];
-    return record;
-}
-
-async function saveChatDB(record) {
-    await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`, {
-        method: 'PUT',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-Master-Key': JSONBIN_MASTER_KEY
-        },
-        body: JSON.stringify(record)
-    });
-}
-
-// 1. Health Check Route
-app.get('/', (req, res) => {
-    res.send('✅ Cloudinary Node.js Server + Chat API is Running!');
-});
-
-// 2. Fetch Feed & Search Route (FIXED: Isolated content and optimized loading)
-app.get('/api/feed', async (req, res) => {
+// Fetch existing pins from Cloudinary on Server Startup
+async function loadExistingPins() {
     try {
-        const searchTag = req.query.search;
-        // FIX: Only fetch images explicitly uploaded by this app (Stops random Cloudinary images)
-        let expression = 'resource_type:image AND tags="pinterest_app"';
-
-        if (searchTag) {
-            expression += ` AND tags="${searchTag}"`;
-        }
-        
-        const result = await cloudinary.search
-            .expression(expression)
-            .sort_by('uploaded_at', 'desc')
-            .max_results(50)
-            .with_field('tags')
-            .execute();
-        
-        // FIX: Inject Cloudinary optimization parameters for speed (w_400,q_auto,f_auto)
-        const optimizedPins = result.resources.map(pin => {
-            const optimizedUrl = pin.secure_url.replace('/upload/', '/upload/w_400,q_auto,f_auto/');
-            return { ...pin, secure_url: optimizedUrl };
+        console.log("Fetching existing images from Cloudinary...");
+        const result = await cloudinary.api.resources({
+            type: 'upload',
+            prefix: 'pinterest_feed/',
+            max_results: 100,
+            tags: true,
+            context: true
         });
         
-        res.json({ success: true, pins: optimizedPins });
+        if (result && result.resources) {
+            feedData = result.resources.map(res => ({
+                id: res.asset_id,
+                imageUrl: res.secure_url,
+                title: res.context?.custom?.title || "Untitled",
+                tags: res.tags || [],
+                height: Math.floor(Math.random() * (350 - 180 + 1) + 180),
+                createdAt: res.created_at
+            }));
+            
+            feedData.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+            console.log(`Successfully loaded ${feedData.length} pins from Cloudinary.`);
+        }
     } catch (error) {
-        console.error("Error fetching feed:", error);
-        res.status(500).json({ success: false, message: error.message });
+        console.error("Notice: Could not load initial pins. This is normal if the Cloudinary folder is empty.", error.message);
     }
+}
+loadExistingPins();
+
+// API ROUTES
+
+app.get('/api/pins', (req, res) => {
+    res.json(feedData);
 });
 
-// 3. Upload Image Route (FIXED: Tagging uploads properly)
-app.post('/api/upload', upload.single('image'), (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).json({ success: false, message: 'No image provided.' });
-        }
-
-        const tag = req.body.tag ? req.body.tag.toLowerCase() : 'untagged';
-        
-        // FIX: Add 'pinterest_app' tag so we own this content and don't pull random files
-        const uploadStream = cloudinary.uploader.upload_stream(
-            { tags: ['pinterest_app', tag] },
-            (error, result) => {
-                if (error) {
-                    console.error("Cloudinary upload error:", error);
-                    return res.status(500).json({ success: false, message: 'Upload failed.' });
-                }
-                res.json({ success: true, pin: result });
+app.post('/api/upload', upload.single('file'), (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ error: "No image file provided" });
+    }
+    
+    const title = req.body.title || 'New Pin';
+    const tags = req.body.tags ? req.body.tags.split(',').map(tag => tag.trim()) : [];
+    
+    const uploadStream = cloudinary.uploader.upload_stream(
+        {
+            folder: "pinterest_feed",
+            tags: tags,
+            context: `title=${title}`
+        },
+        (error, result) => {
+            if (error) {
+                console.error("Cloudinary Upload Error:", error);
+                return res.status(500).json({ error: "Upload failed" });
             }
-        );
-        
-        uploadStream.end(req.file.buffer);
-        
-    } catch (error) {
-        console.error("Server error during upload:", error);
-        res.status(500).json({ success: false, message: 'Server error during upload.' });
-    }
-});
-
-// 4. Get Entire Chat Database
-app.get('/api/chat/db', async (req, res) => {
-    try {
-        const db = await getChatDB();
-        res.json({ success: true, data: db });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to fetch chat database.' });
-    }
-});
-
-// 5. Add/Register a New User
-app.post('/api/chat/user', async (req, res) => {
-    try {
-        const { email } = req.body;
-        if (!email) return res.status(400).json({ success: false, message: "Email required." });
-
-        let db = await getChatDB();
-        if (!db.users.includes(email)) {
-            db.users.push(email);
-            await saveChatDB(db);
+            
+            const newPin = {
+                id: result.asset_id,
+                imageUrl: result.secure_url,
+                title: title,
+                tags: tags,
+                height: Math.floor(Math.random() * (350 - 180 + 1) + 180),
+                createdAt: result.created_at
+            };
+            
+            feedData.unshift(newPin);
+            
+            // Broadcast new pin to frontend instantly
+            io.emit('new_pin', newPin);
+            
+            res.status(201).json({ message: "Upload successful", pin: newPin });
         }
-        res.json({ success: true, users: db.users });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to register user.' });
-    }
+    );
+    
+    const bufferStream = new Readable();
+    bufferStream.push(req.file.buffer);
+    bufferStream.push(null);
+    bufferStream.pipe(uploadStream);
 });
 
-// 6. Send a New Chat Message
-app.post('/api/chat/message', async (req, res) => {
-    try {
-        const { sender, receiver, text, timestamp } = req.body;
-        if (!sender || !receiver || !text) {
-            return res.status(400).json({ success: false, message: "Missing message details." });
-        }
-
-        let db = await getChatDB();
-        db.messages.push({ sender, receiver, text, timestamp: timestamp || Date.now() });
-        await saveChatDB(db);
-
-        res.json({ success: true, message: "Message sent successfully!" });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to send message.' });
-    }
+app.get('/', (req, res) => {
+    res.send("Pinterest Backend Server is running successfully!");
 });
 
-app.listen(PORT, () => {
-    console.log(`🚀 Server is running on port ${PORT}`);
+// Prevent server crash on unexpected errors
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
+});
+
+// START THE SERVER
+const PORT = process.env.PORT || 5000;
+
+// Binding to '0.0.0.0' guarantees it works smoothly on Render
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server is running on port ${PORT}`);
+}).on('error', (err) => {
+    console.error('Failed to start server. Port might be in use:', err);
 });
