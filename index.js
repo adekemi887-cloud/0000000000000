@@ -28,8 +28,6 @@ const upload = multer({ storage: multer.memoryStorage() });
 let cloudinaryFeed = [];
 let mixedGlobalFeed = []; 
 
-const FETCH_HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36' };
-
 // 1. Fetch from Cloudinary
 async function getCloudinaryPins() {
     try {
@@ -48,61 +46,92 @@ async function getCloudinaryPins() {
     } catch (e) { console.error("Cloudinary error:", e.message); }
 }
 
-// Helper: Extract valid, safe, lightweight images from Reddit JSON
-function extractRedditImages(children) {
-    return children
-        .filter(c => c.data && !c.data.over_18 && c.data.post_hint === 'image' && c.data.preview?.images?.[0])
-        .map(c => {
-            const imgData = c.data.preview.images[0];
-            const thumbData = imgData.resolutions.find(r => r.width >= 320) || imgData.resolutions[0] || imgData.source;
+// 2. Fetch from Picsum (Provides high-quality modern Unsplash photography)
+async function getPicsumPins() {
+    try {
+        // Grab a random page so it changes every time the cache updates
+        const randomPage = Math.floor(Math.random() * 10) + 1;
+        const res = await fetch(`https://picsum.photos/v2/list?page=${randomPage}&limit=40`);
+        const json = await res.json();
+        
+        return json.map(img => {
+            // Calculate proportional height for a 400px wide thumbnail
+            const ratio = img.height / img.width;
+            const thumbHeight = Math.floor(400 * ratio);
+            
             return {
-                id: 'reddit_' + c.data.id,
-                imageUrl: imgData.source.url.replace(/&amp;/g, '&'),
-                thumbnailUrl: thumbData.url.replace(/&amp;/g, '&'), 
-                title: c.data.title.substring(0, 80), // Real authentic titles
-                tags: ['aesthetic', c.data.subreddit?.toLowerCase() || 'search'],
-                width: thumbData.width,
-                height: thumbData.height
+                id: 'picsum_' + img.id,
+                imageUrl: img.download_url, // Full size high-res
+                thumbnailUrl: `https://picsum.photos/id/${img.id}/400/${thumbHeight}`, // Compressed thumbnail
+                title: `Photography by ${img.author}`, // Real artist names
+                tags: ['photography', 'aesthetic', 'modern'],
+                width: img.width,
+                height: img.height
             };
         });
+    } catch (e) { 
+        console.error("Picsum error:", e.message); 
+        return []; 
+    }
 }
 
-// 2. Fetch "Pinterest-Vibe" Content (Fashion, Tech, 3D, Interiors, Portraits)
-async function getAestheticPins() {
+// 3. Fetch from Flickr (Great for targeted aesthetic searches without API keys)
+async function getFlickrPins(searchQuery = 'fashion,workspace,technology,aesthetic') {
     try {
-        // Highly curated list of subreddits that match Pinterest's modern aesthetic exactly
-        const subreddits = 'streetwear+OUTFITS+battlestations+blender+midjourney+RoomPorn+FoodPorn+portraits+CozyPlaces';
-        const res = await fetch(`https://www.reddit.com/r/${subreddits}/hot.json?limit=80`, { headers: FETCH_HEADERS });
+        // Flickr's public feed allows tag searching without API keys and doesn't block Render
+        const res = await fetch(`https://api.flickr.com/services/feeds/photos_public.gne?tags=${encodeURIComponent(searchQuery)}&format=json&nojsoncallback=1`);
         const json = await res.json();
-        return extractRedditImages(json.data.children);
-    } catch (e) { return []; }
+        
+        return json.items.map((item, index) => {
+            // Flickr returns small "_m" urls. We swap them for medium "_z" and large "_b"
+            const thumbUrl = item.media.m.replace('_m.jpg', '_z.jpg'); 
+            const largeUrl = item.media.m.replace('_m.jpg', '_b.jpg');
+            
+            return {
+                id: 'flickr_' + Date.now() + '_' + index,
+                imageUrl: largeUrl,
+                thumbnailUrl: thumbUrl,
+                title: item.title ? item.title.substring(0, 60) : "Inspiration", // Real user titles
+                tags: item.tags ? item.tags.split(' ').slice(0, 3) : [searchQuery],
+                width: 400, // Flickr public doesn't provide exact dimensions, standardizing width
+                height: Math.floor(Math.random() * (350 - 200 + 1) + 200) // Masonry variation
+            };
+        });
+    } catch (e) { 
+        console.error("Flickr error:", e.message); 
+        return []; 
+    }
 }
 
 // ==========================================
 // BACKGROUND CACHE BUILDER
 // ==========================================
 async function buildGlobalFeed() {
-    console.log("Fetching background caches...");
+    console.log("Refreshing background caches...");
     await getCloudinaryPins();
-    const aestheticPins = await getAestheticPins();
+    
+    // Fetch external sources concurrently
+    const [picsum, flickr] = await Promise.all([getPicsumPins(), getFlickrPins()]);
     
     const interleavedFeed = [];
-    const maxLength = Math.max(cloudinaryFeed.length, aestheticPins.length);
+    const maxLength = Math.max(cloudinaryFeed.length, picsum.length, flickr.length);
     
-    // Mix perfectly: [Cloudinary, Pinterest-Vibe, Cloudinary, Pinterest-Vibe...]
+    // Interleave seamlessly: [Cloudinary, Picsum, Flickr, Cloudinary, Picsum...]
     for (let i = 0; i < maxLength; i++) {
         if (cloudinaryFeed[i]) interleavedFeed.push(cloudinaryFeed[i]);
-        if (aestheticPins[i]) interleavedFeed.push(aestheticPins[i]);
+        if (picsum[i]) interleavedFeed.push(picsum[i]);
+        if (flickr[i]) interleavedFeed.push(flickr[i]);
     }
     
     if (interleavedFeed.length > 0) {
         mixedGlobalFeed = interleavedFeed;
-        console.log(`Successfully mixed ${mixedGlobalFeed.length} modern aesthetic pins.`);
+        console.log(`Successfully mixed ${mixedGlobalFeed.length} high-quality pins.`);
     }
 }
 
+// Initial load, then refresh every 10 minutes
 buildGlobalFeed();
-setInterval(buildGlobalFeed, 10 * 60 * 1000); // Re-fetch every 10 mins
+setInterval(buildGlobalFeed, 10 * 60 * 1000); 
 
 // ==========================================
 // API ROUTES
@@ -123,7 +152,7 @@ app.get('/api/pins', (req, res) => {
     });
 });
 
-// LIVE SEARCH (Finds actual matching images for whatever the user searches)
+// LIVE SEARCH 
 app.get('/api/search', async (req, res) => {
     const query = req.query.q;
     if (!query) {
@@ -137,19 +166,16 @@ app.get('/api/search', async (req, res) => {
             (pin.tags && pin.tags.some(tag => tag.toLowerCase().includes(query.toLowerCase())))
         );
 
-        // 2. Search Global Reddit for precise user queries (e.g., "clothes", "software developer")
-        // nsfw:no ensures it stays professional and clean
-        const searchUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(query)}+nsfw:no&sort=relevance&limit=30`;
-        const redditRes = await fetch(searchUrl, { headers: FETCH_HEADERS });
-        const redditJson = await redditRes.json();
-        const globalMatches = extractRedditImages(redditJson.data.children);
+        // 2. Perform Live Search on Flickr (e.g. searching "clothes" or "software developer" works!)
+        const flickrMatches = await getFlickrPins(query);
 
         // Mix local uploads with global search results
         const searchResults = [];
-        const maxLength = Math.max(cloudinaryMatches.length, globalMatches.length);
+        const maxLength = Math.max(cloudinaryMatches.length, flickrMatches.length);
+        
         for (let i = 0; i < maxLength; i++) {
             if (cloudinaryMatches[i]) searchResults.push(cloudinaryMatches[i]);
-            if (globalMatches[i]) searchResults.push(globalMatches[i]);
+            if (flickrMatches[i]) searchResults.push(flickrMatches[i]);
         }
 
         res.json({ data: searchResults, hasMore: false });
@@ -178,6 +204,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
                 height: result.height || 600
             };
 
+            // Inject uploaded pin to the very top immediately
             cloudinaryFeed.unshift(newPin);
             mixedGlobalFeed.unshift(newPin); 
             
@@ -191,7 +218,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     bufferStream.pipe(uploadStream);
 });
 
-app.get('/', (req, res) => res.send("Optimized Backend Running! Modern Aesthetics & Global Search Active."));
+app.get('/', (req, res) => res.send("Optimized Backend Running! Unsplash Imagery & Live Search Active."));
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 
 const PORT = process.env.PORT || 5000;
