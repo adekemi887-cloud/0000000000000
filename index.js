@@ -23,10 +23,10 @@ cloudinary.config({
 const upload = multer({ storage: multer.memoryStorage() });
 
 // ==========================================
-// CACHED MEMORY (NO SHUFFLING, JUST FAST INTERLEAVING)
+// CACHED MEMORY (FAST INTERLEAVING)
 // ==========================================
 let cloudinaryFeed = [];
-let mixedGlobalFeed = []; // Interleaved feed ready to serve instantly
+let mixedGlobalFeed = []; 
 
 const FETCH_HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36' };
 
@@ -48,72 +48,56 @@ async function getCloudinaryPins() {
     } catch (e) { console.error("Cloudinary error:", e.message); }
 }
 
-// 2. Fetch from Reddit (Real User Titles, High Quality Photography/Art)
-async function getRedditPins() {
-    try {
-        const res = await fetch('https://www.reddit.com/r/Art+itookapicture+DesignPorn+EarthPorn/hot.json?limit=50', { headers: FETCH_HEADERS });
-        const json = await res.json();
-        return json.data.children
-            .filter(c => c.data && c.data.post_hint === 'image' && c.data.preview?.images?.[0])
-            .map(c => {
-                const imgData = c.data.preview.images[0];
-                const thumbData = imgData.resolutions.find(r => r.width >= 320) || imgData.resolutions[0] || imgData.source;
-                return {
-                    id: 'reddit_' + c.data.id,
-                    imageUrl: imgData.source.url.replace(/&amp;/g, '&'),
-                    thumbnailUrl: thumbData.url.replace(/&amp;/g, '&'), // Very lightweight thumbnail
-                    title: c.data.title.substring(0, 70), // Real post title!
-                    tags: ['reddit', c.data.subreddit.toLowerCase()],
-                    width: thumbData.width,
-                    height: thumbData.height
-                };
-            });
-    } catch (e) { return []; }
+// Helper: Extract valid, safe, lightweight images from Reddit JSON
+function extractRedditImages(children) {
+    return children
+        .filter(c => c.data && !c.data.over_18 && c.data.post_hint === 'image' && c.data.preview?.images?.[0])
+        .map(c => {
+            const imgData = c.data.preview.images[0];
+            const thumbData = imgData.resolutions.find(r => r.width >= 320) || imgData.resolutions[0] || imgData.source;
+            return {
+                id: 'reddit_' + c.data.id,
+                imageUrl: imgData.source.url.replace(/&amp;/g, '&'),
+                thumbnailUrl: thumbData.url.replace(/&amp;/g, '&'), 
+                title: c.data.title.substring(0, 80), // Real authentic titles
+                tags: ['aesthetic', c.data.subreddit?.toLowerCase() || 'search'],
+                width: thumbData.width,
+                height: thumbData.height
+            };
+        });
 }
 
-// 3. Fetch from Art Institute of Chicago (Public API, Real Artwork Titles, Highly Compressible)
-async function getArtInstitutePins() {
+// 2. Fetch "Pinterest-Vibe" Content (Fashion, Tech, 3D, Interiors, Portraits)
+async function getAestheticPins() {
     try {
-        const res = await fetch('https://api.artic.edu/api/v1/artworks?limit=50&fields=id,title,image_id,thumbnail');
+        // Highly curated list of subreddits that match Pinterest's modern aesthetic exactly
+        const subreddits = 'streetwear+OUTFITS+battlestations+blender+midjourney+RoomPorn+FoodPorn+portraits+CozyPlaces';
+        const res = await fetch(`https://www.reddit.com/r/${subreddits}/hot.json?limit=80`, { headers: FETCH_HEADERS });
         const json = await res.json();
-        return json.data
-            .filter(item => item.image_id && item.thumbnail)
-            .map(item => ({
-                id: 'art_' + item.id,
-                imageUrl: `https://www.artic.edu/iiif/2/${item.image_id}/full/843,/0/default.jpg`,
-                thumbnailUrl: `https://www.artic.edu/iiif/2/${item.image_id}/full/400,/0/default.jpg`, // Request exactly 400px wide
-                title: item.title, // Real artwork title!
-                tags: ['art', 'museum', 'aesthetic'],
-                width: item.thumbnail.width || 400,
-                height: item.thumbnail.height || 600
-            }));
+        return extractRedditImages(json.data.children);
     } catch (e) { return []; }
 }
 
 // ==========================================
-// BACKGROUND CACHE BUILDER (FAST LINEAR INTERLEAVING)
+// BACKGROUND CACHE BUILDER
 // ==========================================
 async function buildGlobalFeed() {
     console.log("Fetching background caches...");
     await getCloudinaryPins();
-    
-    // Fetch external sources concurrently
-    const [reddit, museumArt] = await Promise.all([getRedditPins(), getArtInstitutePins()]);
+    const aestheticPins = await getAestheticPins();
     
     const interleavedFeed = [];
-    const maxLength = Math.max(cloudinaryFeed.length, reddit.length, museumArt.length);
+    const maxLength = Math.max(cloudinaryFeed.length, aestheticPins.length);
     
-    // Mix perfectly: [Cloudinary1, Reddit1, Art1, Cloudinary2, Reddit2, Art2...]
-    // O(N) complexity - extremely fast, NO CPU heavy Math.random() shuffling
+    // Mix perfectly: [Cloudinary, Pinterest-Vibe, Cloudinary, Pinterest-Vibe...]
     for (let i = 0; i < maxLength; i++) {
         if (cloudinaryFeed[i]) interleavedFeed.push(cloudinaryFeed[i]);
-        if (reddit[i]) interleavedFeed.push(reddit[i]);
-        if (museumArt[i]) interleavedFeed.push(museumArt[i]);
+        if (aestheticPins[i]) interleavedFeed.push(aestheticPins[i]);
     }
     
     if (interleavedFeed.length > 0) {
         mixedGlobalFeed = interleavedFeed;
-        console.log(`Successfully mixed ${mixedGlobalFeed.length} lightweight pins.`);
+        console.log(`Successfully mixed ${mixedGlobalFeed.length} modern aesthetic pins.`);
     }
 }
 
@@ -127,7 +111,7 @@ setInterval(buildGlobalFeed, 10 * 60 * 1000); // Re-fetch every 10 mins
 // FAST FEED PAGINATION
 app.get('/api/pins', (req, res) => {
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20; // Send exactly 20 items per scroll
+    const limit = parseInt(req.query.limit) || 20; 
     
     const startIndex = (page - 1) * limit;
     const endIndex = page * limit;
@@ -137,6 +121,42 @@ app.get('/api/pins', (req, res) => {
         currentPage: page,
         hasMore: endIndex < mixedGlobalFeed.length
     });
+});
+
+// LIVE SEARCH (Finds actual matching images for whatever the user searches)
+app.get('/api/search', async (req, res) => {
+    const query = req.query.q;
+    if (!query) {
+        return res.json({ data: mixedGlobalFeed.slice(0, 20), hasMore: false });
+    }
+
+    try {
+        // 1. Search Cloudinary Local Uploads
+        const cloudinaryMatches = cloudinaryFeed.filter(pin => 
+            (pin.title && pin.title.toLowerCase().includes(query.toLowerCase())) ||
+            (pin.tags && pin.tags.some(tag => tag.toLowerCase().includes(query.toLowerCase())))
+        );
+
+        // 2. Search Global Reddit for precise user queries (e.g., "clothes", "software developer")
+        // nsfw:no ensures it stays professional and clean
+        const searchUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(query)}+nsfw:no&sort=relevance&limit=30`;
+        const redditRes = await fetch(searchUrl, { headers: FETCH_HEADERS });
+        const redditJson = await redditRes.json();
+        const globalMatches = extractRedditImages(redditJson.data.children);
+
+        // Mix local uploads with global search results
+        const searchResults = [];
+        const maxLength = Math.max(cloudinaryMatches.length, globalMatches.length);
+        for (let i = 0; i < maxLength; i++) {
+            if (cloudinaryMatches[i]) searchResults.push(cloudinaryMatches[i]);
+            if (globalMatches[i]) searchResults.push(globalMatches[i]);
+        }
+
+        res.json({ data: searchResults, hasMore: false });
+    } catch (error) {
+        console.error("Search API Error:", error);
+        res.status(500).json({ error: "Search failed" });
+    }
 });
 
 // CLOUDINARY UPLOAD
@@ -158,7 +178,6 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
                 height: result.height || 600
             };
 
-            // Inject uploaded pin to the very top of both feeds immediately
             cloudinaryFeed.unshift(newPin);
             mixedGlobalFeed.unshift(newPin); 
             
@@ -172,7 +191,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     bufferStream.pipe(uploadStream);
 });
 
-app.get('/', (req, res) => res.send("Optimized Backend Running! Reddit & Museum APIs Active. No Shuffling."));
+app.get('/', (req, res) => res.send("Optimized Backend Running! Modern Aesthetics & Global Search Active."));
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 
 const PORT = process.env.PORT || 5000;
