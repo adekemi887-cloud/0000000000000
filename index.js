@@ -26,16 +26,35 @@ const upload = multer({ storage: multer.memoryStorage() });
 // SMART CACHE & PERSONALIZATION SYSTEM
 // ==========================================
 let cloudinaryFeed = [];
-
-// Store keyword-specific caches: { "fashion": [...pins], "bag": [...pins] }
-const keywordCache = {}; 
-
-// Store user profiles: { "user_123": { seen: Set(), interests: { bag: 10, luxury: 5 } } }
-const userProfiles = {}; 
-
+const keywordCache = {}; // { "fashion": [...pins], "bag": [...pins] }
+const userProfiles = {}; // { "user_123": { seen: Set(), interests: {} } }
 const DEFAULT_TOPICS = ["minimalist aesthetic", "streetwear fashion", "interior design", "cinematic photography"];
 
-// --- External API Fetchers ---
+// --- 1. Cloudinary Fetcher (RESTORED & FIXED) ---
+async function getCloudinaryPins() {
+    try {
+        const result = await cloudinary.api.resources({ type: 'upload', prefix: 'pinterest_feed/', max_results: 100, context: true });
+        if (result && result.resources) {
+            cloudinaryFeed = result.resources.map(res => ({
+                id: res.asset_id,
+                imageUrl: res.secure_url,
+                thumbnailUrl: res.secure_url.replace('/upload/', '/upload/w_400,c_scale,q_auto,f_auto/'),
+                title: res.context?.custom?.title || "Uploaded Pin",
+                tags: res.tags || [],
+                width: res.width || 400,
+                height: res.height || 600
+            }));
+            console.log(`[Cloudinary] Loaded ${cloudinaryFeed.length} local pins.`);
+        }
+    } catch (e) { console.error("Cloudinary error:", e.message); }
+}
+
+// Initialize on startup & refresh every 10 mins
+getCloudinaryPins();
+setInterval(getCloudinaryPins, 10 * 60 * 1000);
+
+
+// --- 2. External API Fetchers ---
 async function getLexicaPins(query) {
     try {
         const res = await fetch(`https://lexica.art/api/v1/search?q=${encodeURIComponent(query)}`);
@@ -76,7 +95,7 @@ async function getFlickrPins(query) {
 async function ensureKeywordCache(keyword) {
     if (!keywordCache[keyword]) keywordCache[keyword] = [];
     if (keywordCache[keyword].length < 40) {
-        console.log(`Fetching external APIs to build cache for: "${keyword}"`);
+        console.log(`[API Fetch] Building cache for: "${keyword}"`);
         const [lexica, flickr] = await Promise.all([getLexicaPins(keyword), getFlickrPins(keyword)]);
         const newPins = [...lexica, ...flickr].sort(() => 0.5 - Math.random());
         
@@ -86,63 +105,85 @@ async function ensureKeywordCache(keyword) {
     }
 }
 
+
 // ==========================================
 // API ROUTES
 // ==========================================
 
-// 1. SMART PERSONALIZED FEED
+// 1. SMART PERSONALIZED FEED (WITH GUARANTEED CLOUDINARY INCLUSION)
 app.get('/api/pins', async (req, res) => {
     const userId = req.query.userId || 'anonymous';
     const limit = parseInt(req.query.limit) || 20; 
     let incomingInterests = req.query.interests ? req.query.interests.split(',') : [];
 
-    // Initialize user session
     if (!userProfiles[userId]) {
         userProfiles[userId] = { seen: new Set(), interests: {} };
     }
     const profile = userProfiles[userId];
 
-    // Determine target keywords (Use user interests OR fallback to defaults)
+    // Determine target keywords
     let targetKeywords = incomingInterests.length > 0 ? incomingInterests : Object.keys(profile.interests).sort((a, b) => profile.interests[b] - profile.interests[a]).slice(0, 3);
     if (targetKeywords.length === 0) targetKeywords = [DEFAULT_TOPICS[Math.floor(Math.random() * DEFAULT_TOPICS.length)]];
 
-    // Ensure all target keywords have loaded caches
+    // Ensure external caches are built
     await Promise.all(targetKeywords.map(kw => ensureKeywordCache(kw)));
 
-    // Pool all matching pins together
-    let availablePins = [...cloudinaryFeed];
-    targetKeywords.forEach(kw => { if (keywordCache[kw]) availablePins.push(...keywordCache[kw]); });
+    // --- SEPARATE POOLS LOGIC ---
     
-    // Filter out ALREADY SEEN pins for this exact user!
-    availablePins = availablePins.filter(pin => !profile.seen.has(pin.id));
+    // Pool 1: External Content
+    let externalPins = [];
+    targetKeywords.forEach(kw => { if (keywordCache[kw]) externalPins.push(...keywordCache[kw]); });
+    
+    // ONLY filter external content by what the user has seen
+    externalPins = externalPins.filter(pin => !profile.seen.has(pin.id));
 
-    // Fallback: If they consumed everything, clear their history and restart
-    if (availablePins.length < limit) {
-        console.log(`User ${userId} consumed all content. Resetting seen history.`);
-        profile.seen.clear();
-        availablePins = [...cloudinaryFeed];
-        targetKeywords.forEach(kw => { if (keywordCache[kw]) availablePins.push(...keywordCache[kw]); });
+    // Ratio Enforcement: Try to make ~35% of the feed Cloudinary (user uploads)
+    const CLOUD_RATIO = 0.35;
+    let cloudLimit = Math.floor(limit * CLOUD_RATIO);
+    let extLimit = limit - cloudLimit;
+
+    // Pick Cloudinary Pins (Never filtered by "seen", randomly shuffled so it stays fresh)
+    let cloudSelection = [...cloudinaryFeed].sort(() => 0.5 - Math.random()).slice(0, cloudLimit);
+
+    // If Cloudinary lacks enough pins, give the extra slots to external APIs
+    if (cloudSelection.length < cloudLimit) {
+        extLimit += (cloudLimit - cloudSelection.length);
     }
 
-    // Shuffle and slice
-    const selectedPins = availablePins.sort(() => 0.5 - Math.random()).slice(0, limit);
+    // Fallback if user consumed ALL external content for these keywords
+    if (externalPins.length < extLimit) {
+        console.log(`[Cache Reset] User ${userId} consumed all external content. Clearing history.`);
+        profile.seen.clear();
+        externalPins = [];
+        targetKeywords.forEach(kw => { if (keywordCache[kw]) externalPins.push(...keywordCache[kw]); });
+    }
 
-    // Mark as seen
-    selectedPins.forEach(pin => profile.seen.add(pin.id));
+    let extSelection = externalPins.sort(() => 0.5 - Math.random()).slice(0, extLimit);
+
+    // Track newly seen EXTERNAL pins
+    extSelection.forEach(pin => profile.seen.add(pin.id));
+
+    // Mix them together naturally
+    const finalFeed = [...cloudSelection, ...extSelection].sort(() => 0.5 - Math.random());
+
+    // Debugging Outputs
+    console.log(`[Feed Generation] User: ${userId}`);
+    console.log(`-> Cloudinary DB: ${cloudinaryFeed.length} | Serving: ${cloudSelection.length}`);
+    console.log(`-> Keyword Pools: ${Object.keys(keywordCache).join(', ')} | Serving: ${extSelection.length}`);
 
     res.json({
-        data: selectedPins,
+        data: finalFeed,
         hasMore: true
     });
 });
 
-// 2. LIVE SEARCH (DETERMINISTIC, NO ROTATION)
+// 2. LIVE SEARCH (DETERMINISTIC)
 app.get('/api/search', async (req, res) => {
     const query = req.query.q;
     if (!query) return res.json({ data: [], hasMore: false });
 
     try {
-        await ensureKeywordCache(query); // Ensure we have raw data
+        await ensureKeywordCache(query); 
         let searchResults = [...keywordCache[query]];
 
         // Prepend local uploads matching the query
@@ -150,6 +191,11 @@ app.get('/api/search', async (req, res) => {
             (pin.title && pin.title.toLowerCase().includes(query.toLowerCase())) ||
             (pin.tags && pin.tags.some(tag => tag.toLowerCase().includes(query.toLowerCase())))
         );
+        
+        // Remove duplicates if Cloudinary matches existed in external somehow
+        const cloudIds = new Set(cloudinaryMatches.map(p => p.id));
+        searchResults = searchResults.filter(p => !cloudIds.has(p.id));
+
         searchResults = [...cloudinaryMatches, ...searchResults];
 
         res.json({ data: searchResults, hasMore: searchResults.length > 0 });
@@ -172,8 +218,11 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
                 thumbnailUrl: result.secure_url.replace('/upload/', '/upload/w_400,c_scale,q_auto,f_auto/'),
                 title: title, width: result.width || 400, height: result.height || 600, tags: []
             };
+            
+            // Add instantly to global memory
             cloudinaryFeed.unshift(newPin);
             io.emit('new_pin', newPin);
+            
             res.status(201).json({ message: "Upload successful", pin: newPin });
         }
     );
