@@ -8,37 +8,44 @@ const { Readable } = require('stream');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+const io = new Server(server, {
+    cors: { origin: "*", methods: ["GET", "POST"] }
+});
 
 app.use(cors());
 app.use(express.json());
 
-// Cloudinary Configuration
 cloudinary.config({
     cloud_name: 'dyhhksvot',
     api_key: '843162796934642',
     api_secret: 'BZuIO8S5N9JxNB_zTDRRbRf6j2U'
 });
 
-const upload = multer({ storage: multer.memoryStorage() });
+const storage = multer.memoryStorage();
+const upload = multer({ storage: storage });
 
 // ==========================================
-// CACHED MEMORY (FAST INTERLEAVING)
+// OPTIMIZED CACHE & STATE
 // ==========================================
 let cloudinaryFeed = [];
-let mixedGlobalFeed = []; 
+let globalShuffledFeed = []; // Shuffled ONCE during background cache update
 
-// Default modern topics to make the home feed look exactly like Pinterest
-const AESTHETIC_TOPICS = [
-    "minimalist workspace setup", 
-    "streetwear fashion outfit", 
-    "3d blender abstract design", 
-    "cozy modern interior room",
-    "cinematic portrait photography",
-    "neon cyberpunk aesthetic"
-];
+function shuffleArray(array) {
+    let mixed = [...array];
+    for (let i = mixed.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [mixed[i], mixed[j]] = [mixed[j], mixed[i]];
+    }
+    return mixed;
+}
 
-// 1. Fetch from Cloudinary
+// ==========================================
+// EXTERNAL API FETCHERS (WITH THUMBNAILS & DIMENSIONS)
+// ==========================================
+const FETCH_HEADERS = { 
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36' 
+};
+
 async function getCloudinaryPins() {
     try {
         const result = await cloudinary.api.resources({ type: 'upload', prefix: 'pinterest_feed/', max_results: 100, context: true });
@@ -46,155 +53,138 @@ async function getCloudinaryPins() {
             cloudinaryFeed = result.resources.map(res => ({
                 id: res.asset_id,
                 imageUrl: res.secure_url,
+                // Cloudinary native on-the-fly thumbnail generation (width 400px, auto format/quality)
                 thumbnailUrl: res.secure_url.replace('/upload/', '/upload/w_400,c_scale,q_auto,f_auto/'),
                 title: res.context?.custom?.title || "Uploaded Pin",
                 tags: res.tags || [],
                 width: res.width || 400,
-                height: res.height || 600
+                height: res.height || 600,
+                createdAt: res.created_at
             }));
         }
-    } catch (e) { console.error("Cloudinary error:", e.message); }
+    } catch (e) { console.error("Cloudinary fetch error:", e.message); }
 }
 
-// 2. Fetch from Lexica.art (Stunning Modern 3D, Fashion, Tech, Architecture)
-// Returns real descriptive prompts as titles!
-async function getLexicaPins(searchQuery = "") {
+async function getRedditPins() {
     try {
-        // If no search query, pick a random aesthetic topic for the home feed
-        const query = searchQuery || AESTHETIC_TOPICS[Math.floor(Math.random() * AESTHETIC_TOPICS.length)];
-        const res = await fetch(`https://lexica.art/api/v1/search?q=${encodeURIComponent(query)}`);
+        const res = await fetch('https://www.reddit.com/r/wallpapers+EarthPorn+DesignPorn+Amoledbackgrounds/hot.json?limit=40', { headers: FETCH_HEADERS });
         const json = await res.json();
-        
-        return json.images.slice(0, 40).map(img => ({
-            id: 'lexica_' + img.id,
-            imageUrl: img.src,
-            thumbnailUrl: img.srcSmall, // Lexica provides highly compressed thumbnails natively
-            title: img.prompt.split(',')[0].substring(0, 70), // Use the first part of the prompt as a clean title
-            tags: ['aesthetic', 'modern', query.split(' ')[0]],
-            width: img.width,
-            height: img.height
+        return json.data.children
+            .filter(c => c.data && c.data.post_hint === 'image' && c.data.preview?.images?.[0])
+            .map(c => {
+                const imgData = c.data.preview.images[0];
+                const highResUrl = imgData.source.url.replace(/&amp;/g, '&');
+                // Find a medium resolution for the thumbnail
+                const thumbData = imgData.resolutions.find(r => r.width >= 300) || imgData.resolutions[0] || imgData.source;
+                return {
+                    id: 'reddit_' + c.data.id,
+                    imageUrl: highResUrl,
+                    thumbnailUrl: thumbData.url.replace(/&amp;/g, '&'),
+                    title: c.data.title.substring(0, 50),
+                    tags: ['reddit', 'wallpaper'],
+                    width: imgData.source.width,
+                    height: imgData.source.height,
+                    createdAt: new Date(c.data.created_utc * 1000).toISOString()
+                };
+            });
+    } catch (e) { return []; }
+}
+
+async function getWallhavenPins(searchQuery = "") {
+    try {
+        const url = searchQuery 
+            ? `https://wallhaven.cc/api/v1/search?q=${encodeURIComponent(searchQuery)}&sorting=relevance&purity=100&limit=30`
+            : `https://wallhaven.cc/api/v1/search?sorting=random&purity=100&limit=30`;
+        const res = await fetch(url, { headers: FETCH_HEADERS });
+        const json = await res.json();
+        return json.data.map(item => ({
+            id: 'wallhaven_' + item.id,
+            imageUrl: item.path,
+            thumbnailUrl: item.thumbs.regular || item.thumbs.small, // Small thumbnail for feed
+            title: searchQuery ? `Wallhaven ${searchQuery}` : "HD Wallpaper",
+            tags: ['wallhaven', 'design'],
+            width: item.dimension_x,
+            height: item.dimension_y,
+            createdAt: new Date().toISOString()
         }));
-    } catch (e) { 
-        console.error("Lexica error:", e.message); 
-        return []; 
-    }
+    } catch (e) { return []; }
 }
 
-// 3. Fetch from Flickr (Real world photography, architecture, fashion)
-async function getFlickrPins(searchQuery = "") {
+async function getDanbooruPins(searchQuery = "") {
     try {
-        const query = searchQuery || "aesthetic,fashion,architecture";
-        const res = await fetch(`https://api.flickr.com/services/feeds/photos_public.gne?tags=${encodeURIComponent(query)}&format=json&nojsoncallback=1`);
+        const query = searchQuery ? encodeURIComponent(searchQuery.split(' ')[0] + ' rating:safe') : 'rating:safe';
+        const res = await fetch(`https://danbooru.donmai.us/posts.json?limit=30&tags=${query}`, { headers: FETCH_HEADERS });
         const json = await res.json();
-        
-        return json.items.map((item, index) => {
-            const thumbUrl = item.media.m.replace('_m.jpg', '_z.jpg'); 
-            const largeUrl = item.media.m.replace('_m.jpg', '_b.jpg');
-            
-            // Clean up Flickr titles (remove dates/camera names often found in titles)
-            let cleanTitle = item.title ? item.title.trim() : "Inspiration";
-            if (cleanTitle.toLowerCase().includes('dsc') || cleanTitle.toLowerCase().includes('img')) {
-                cleanTitle = "Aesthetic Photography";
-            }
-            
-            return {
-                id: 'flickr_' + Date.now() + '_' + index,
-                imageUrl: largeUrl,
-                thumbnailUrl: thumbUrl,
-                title: cleanTitle.substring(0, 60),
-                tags: item.tags ? item.tags.split(' ').slice(0, 3) : [],
-                width: 400, 
-                height: Math.floor(Math.random() * (350 - 200 + 1) + 200) 
-            };
-        });
-    } catch (e) { 
-        console.error("Flickr error:", e.message); 
-        return []; 
-    }
+        return json
+            .filter(item => item.large_file_url && item.image_width)
+            .map(item => ({
+                id: 'danbooru_' + item.id,
+                imageUrl: item.large_file_url,
+                thumbnailUrl: item.preview_file_url || item.large_file_url, // Highly compressed thumbnail
+                title: "Anime Art",
+                tags: ['danbooru', 'anime'],
+                width: item.image_width,
+                height: item.image_height,
+                createdAt: item.created_at
+            }));
+    } catch (e) { return []; }
 }
 
 // ==========================================
-// BACKGROUND CACHE BUILDER
+// BACKGROUND POLLING (CPU EFFICIENT)
 // ==========================================
 async function buildGlobalFeed() {
-    console.log("Refreshing background caches with modern content...");
+    console.log("Refreshing background caches...");
     await getCloudinaryPins();
+    const [reddit, wallhaven, danbooru] = await Promise.all([getRedditPins(), getWallhavenPins(), getDanbooruPins()]);
     
-    // Fetch external sources concurrently
-    const [lexica, flickr] = await Promise.all([getLexicaPins(), getFlickrPins()]);
-    
-    const interleavedFeed = [];
-    const maxLength = Math.max(cloudinaryFeed.length, lexica.length, flickr.length);
-    
-    // Interleave seamlessly
-    for (let i = 0; i < maxLength; i++) {
-        if (cloudinaryFeed[i]) interleavedFeed.push(cloudinaryFeed[i]);
-        if (lexica[i]) interleavedFeed.push(lexica[i]);
-        if (flickr[i]) interleavedFeed.push(flickr[i]);
-    }
-    
-    if (interleavedFeed.length > 0) {
-        mixedGlobalFeed = interleavedFeed;
-        console.log(`Successfully mixed ${mixedGlobalFeed.length} highly aesthetic pins.`);
+    // Combine and shuffle ONCE.
+    const combined = [...cloudinaryFeed, ...reddit, ...wallhaven, ...danbooru];
+    if (combined.length > 0) {
+        globalShuffledFeed = shuffleArray(combined);
+        console.log(`Cache updated. Mixed ${globalShuffledFeed.length} total pins. Ready to serve instantly.`);
     }
 }
-
-// Initial load, then refresh every 10 minutes
 buildGlobalFeed();
-setInterval(buildGlobalFeed, 10 * 60 * 1000); 
+setInterval(buildGlobalFeed, 10 * 60 * 1000); // Re-fetch and re-shuffle every 10 mins
 
 // ==========================================
 // API ROUTES
 // ==========================================
 
-// FAST FEED PAGINATION (For Home Page)
+// PAGINATED FEED ENDPOINT
 app.get('/api/pins', (req, res) => {
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20; 
+    const limit = parseInt(req.query.limit) || 20;
     
     const startIndex = (page - 1) * limit;
     const endIndex = page * limit;
     
+    const paginatedResults = globalShuffledFeed.slice(startIndex, endIndex);
+    
     res.json({
-        data: mixedGlobalFeed.slice(startIndex, endIndex),
+        data: paginatedResults,
         currentPage: page,
-        hasMore: endIndex < mixedGlobalFeed.length
+        hasMore: endIndex < globalShuffledFeed.length,
+        totalItems: globalShuffledFeed.length
     });
 });
 
-// TRUE GLOBAL SEARCH (Actively searches databases based on user keyword)
+// SEARCH API (Uses mapping format)
 app.get('/api/search', async (req, res) => {
     const query = req.query.q;
-    if (!query) {
-        return res.json({ data: mixedGlobalFeed.slice(0, 20), hasMore: false });
-    }
+    if (!query) return res.json({ data: globalShuffledFeed.slice(0, 20), hasMore: false });
 
     try {
-        // 1. Search Local Uploads
+        const [wallhaven, danbooru] = await Promise.all([getWallhavenPins(query), getDanbooruPins(query)]);
         const cloudinaryMatches = cloudinaryFeed.filter(pin => 
             (pin.title && pin.title.toLowerCase().includes(query.toLowerCase())) ||
             (pin.tags && pin.tags.some(tag => tag.toLowerCase().includes(query.toLowerCase())))
         );
 
-        // 2. Perform LIVE Search across external databases using the user's exact keyword!
-        const [lexicaMatches, flickrMatches] = await Promise.all([
-            getLexicaPins(query),
-            getFlickrPins(query)
-        ]);
-
-        // Interleave the matching search results
-        const searchResults = [];
-        const maxLength = Math.max(cloudinaryMatches.length, lexicaMatches.length, flickrMatches.length);
-        
-        for (let i = 0; i < maxLength; i++) {
-            if (cloudinaryMatches[i]) searchResults.push(cloudinaryMatches[i]);
-            if (lexicaMatches[i]) searchResults.push(lexicaMatches[i]);
-            if (flickrMatches[i]) searchResults.push(flickrMatches[i]);
-        }
-
-        res.json({ data: searchResults, hasMore: false });
+        const searchResults = shuffleArray([...cloudinaryMatches, ...wallhaven, ...danbooru]);
+        res.json({ data: searchResults, hasMore: false }); // Limit search to 1 batch for performance
     } catch (error) {
-        console.error("Search API Error:", error);
         res.status(500).json({ error: "Search failed" });
     }
 });
@@ -203,7 +193,6 @@ app.get('/api/search', async (req, res) => {
 app.post('/api/upload', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: "No image file provided" });
     const title = req.body.title || 'New Pin';
-    
     const uploadStream = cloudinary.uploader.upload_stream(
         { folder: "pinterest_feed", context: `title=${title}` },
         (error, result) => {
@@ -215,13 +204,12 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
                 thumbnailUrl: result.secure_url.replace('/upload/', '/upload/w_400,c_scale,q_auto,f_auto/'),
                 title: title,
                 width: result.width || 400,
-                height: result.height || 600
+                height: result.height || 600,
+                createdAt: result.created_at
             };
 
-            // Inject uploaded pin to the very top immediately
             cloudinaryFeed.unshift(newPin);
-            mixedGlobalFeed.unshift(newPin); 
-            
+            globalShuffledFeed.unshift(newPin); // Add to top of feed immediately
             io.emit('new_pin', newPin);
             res.status(201).json({ message: "Upload successful", pin: newPin });
         }
@@ -232,7 +220,8 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     bufferStream.pipe(uploadStream);
 });
 
-app.get('/', (req, res) => res.send("Optimized Backend Running! Lexica.art & True Global Search Active."));
+app.get('/', (req, res) => res.send("Optimized Backend Running! Pagination and Thumbnails active."));
+
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 
 const PORT = process.env.PORT || 5000;
