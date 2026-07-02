@@ -22,209 +22,184 @@ cloudinary.config({
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Memory Data stores
-const globalPinPool = new Map(); // Generic fallback pool
-const sessionFeeds = new Map();  // User-specific personalized feeds
-const searchCache = new Map();   // Saved search queries
+// ==========================================
+// CACHED MEMORY (FAST INTERLEAVING)
+// ==========================================
+let cloudinaryFeed = [];
+let mixedGlobalFeed = []; 
 
+// Default modern topics to make the home feed look exactly like Pinterest
 const AESTHETIC_TOPICS = [
-    "minimalist workspace", "streetwear fashion", "3d abstract blender", 
-    "cozy modern interior", "cinematic photography", "neon cyberpunk",
-    "dark academia", "coffee shop aesthetic", "lofi chill setup"
+    "minimalist workspace setup", 
+    "streetwear fashion outfit", 
+    "3d blender abstract design", 
+    "cozy modern interior room",
+    "cinematic portrait photography",
+    "neon cyberpunk aesthetic"
 ];
 
-function shuffleArray(array) {
-    const arr = [...array];
-    for (let i = arr.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-    return arr;
-}
-
-const getClientIp = (req) => {
-    const forwarded = req.headers['x-forwarded-for'];
-    return forwarded ? forwarded.split(/, /)[0] : (req.socket.remoteAddress || 'anonymous');
-};
-
+// 1. Fetch from Cloudinary
 async function getCloudinaryPins() {
     try {
         const result = await cloudinary.api.resources({ type: 'upload', prefix: 'pinterest_feed/', max_results: 100, context: true });
         if (result && result.resources) {
-            result.resources.forEach(res => {
-                const pin = {
-                    id: res.asset_id, source: 'cloudinary', imageUrl: res.secure_url,
-                    thumbnailUrl: res.secure_url.replace('/upload/', '/upload/w_400,c_scale,q_auto,f_auto/'),
-                    title: res.context?.custom?.title || "Uploaded Pin",
-                    tags: res.tags || [], width: res.width || 400, height: res.height || 600
-                };
-                globalPinPool.set(pin.id, pin);
-            });
+            cloudinaryFeed = result.resources.map(res => ({
+                id: res.asset_id,
+                imageUrl: res.secure_url,
+                thumbnailUrl: res.secure_url.replace('/upload/', '/upload/w_400,c_scale,q_auto,f_auto/'),
+                title: res.context?.custom?.title || "Uploaded Pin",
+                tags: res.tags || [],
+                width: res.width || 400,
+                height: res.height || 600
+            }));
         }
     } catch (e) { console.error("Cloudinary error:", e.message); }
 }
 
+// 2. Fetch from Lexica.art (Stunning Modern 3D, Fashion, Tech, Architecture)
+// Returns real descriptive prompts as titles!
 async function getLexicaPins(searchQuery = "") {
     try {
+        // If no search query, pick a random aesthetic topic for the home feed
         const query = searchQuery || AESTHETIC_TOPICS[Math.floor(Math.random() * AESTHETIC_TOPICS.length)];
-        // Fast Timeout implementation to prevent blocking
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 4000); 
-        
-        const res = await fetch(`https://lexica.art/api/v1/search?q=${encodeURIComponent(query)}`, { signal: controller.signal });
-        clearTimeout(timeoutId);
+        const res = await fetch(`https://lexica.art/api/v1/search?q=${encodeURIComponent(query)}`);
         const json = await res.json();
         
         return json.images.slice(0, 40).map(img => ({
-            id: 'lexica_' + img.id, source: 'external', imageUrl: img.src, thumbnailUrl: img.srcSmall,
-            title: img.prompt.split(',')[0].substring(0, 70), tags: ['aesthetic', query], width: img.width, height: img.height
+            id: 'lexica_' + img.id,
+            imageUrl: img.src,
+            thumbnailUrl: img.srcSmall, // Lexica provides highly compressed thumbnails natively
+            title: img.prompt.split(',')[0].substring(0, 70), // Use the first part of the prompt as a clean title
+            tags: ['aesthetic', 'modern', query.split(' ')[0]],
+            width: img.width,
+            height: img.height
         }));
-    } catch (e) { return []; }
+    } catch (e) { 
+        console.error("Lexica error:", e.message); 
+        return []; 
+    }
 }
 
+// 3. Fetch from Flickr (Real world photography, architecture, fashion)
 async function getFlickrPins(searchQuery = "") {
     try {
-        const query = searchQuery || "aesthetic";
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 4000);
-
-        const res = await fetch(`https://api.flickr.com/services/feeds/photos_public.gne?tags=${encodeURIComponent(query)}&format=json&nojsoncallback=1`, { signal: controller.signal });
-        clearTimeout(timeoutId);
+        const query = searchQuery || "aesthetic,fashion,architecture";
+        const res = await fetch(`https://api.flickr.com/services/feeds/photos_public.gne?tags=${encodeURIComponent(query)}&format=json&nojsoncallback=1`);
         const json = await res.json();
         
         return json.items.map((item, index) => {
             const thumbUrl = item.media.m.replace('_m.jpg', '_z.jpg'); 
             const largeUrl = item.media.m.replace('_m.jpg', '_b.jpg');
+            
+            // Clean up Flickr titles (remove dates/camera names often found in titles)
             let cleanTitle = item.title ? item.title.trim() : "Inspiration";
-            if (cleanTitle.toLowerCase().includes('dsc') || cleanTitle.toLowerCase().includes('img')) cleanTitle = "Aesthetic Photography";
+            if (cleanTitle.toLowerCase().includes('dsc') || cleanTitle.toLowerCase().includes('img')) {
+                cleanTitle = "Aesthetic Photography";
+            }
             
             return {
-                id: 'flickr_' + Date.now() + '_' + index, source: 'external', imageUrl: largeUrl, thumbnailUrl: thumbUrl,
-                title: cleanTitle.substring(0, 60), tags: item.tags ? item.tags.split(' ').slice(0, 3) : [],
-                width: 400, height: Math.floor(Math.random() * (350 - 200 + 1) + 200) 
+                id: 'flickr_' + Date.now() + '_' + index,
+                imageUrl: largeUrl,
+                thumbnailUrl: thumbUrl,
+                title: cleanTitle.substring(0, 60),
+                tags: item.tags ? item.tags.split(' ').slice(0, 3) : [],
+                width: 400, 
+                height: Math.floor(Math.random() * (350 - 200 + 1) + 200) 
             };
         });
-    } catch (e) { return []; }
-}
-
-// Background builder ensures we always have a generic fallback pool available instantly.
-async function buildGlobalFeed() {
-    await getCloudinaryPins(); 
-    const randomTopic1 = AESTHETIC_TOPICS[Math.floor(Math.random() * AESTHETIC_TOPICS.length)];
-    const randomTopic2 = AESTHETIC_TOPICS[Math.floor(Math.random() * AESTHETIC_TOPICS.length)];
-    
-    const [lexica1, lexica2, flickr1, flickr2] = await Promise.all([
-        getLexicaPins(randomTopic1), getLexicaPins(randomTopic2), getFlickrPins(randomTopic1), getFlickrPins(randomTopic2)
-    ]);
-    
-    [...lexica1, ...lexica2, ...flickr1, ...flickr2].forEach(pin => globalPinPool.set(pin.id, pin));
-    if (globalPinPool.size > 2000) {
-        let deletedCount = 0; const targetDelete = globalPinPool.size - 2000;
-        for (const [key, pin] of globalPinPool.entries()) {
-            if (pin.source === 'external') { globalPinPool.delete(key); deletedCount++; }
-            if (deletedCount >= targetDelete) break;
-        }
+    } catch (e) { 
+        console.error("Flickr error:", e.message); 
+        return []; 
     }
 }
+
+// ==========================================
+// BACKGROUND CACHE BUILDER
+// ==========================================
+async function buildGlobalFeed() {
+    console.log("Refreshing background caches with modern content...");
+    await getCloudinaryPins();
+    
+    // Fetch external sources concurrently
+    const [lexica, flickr] = await Promise.all([getLexicaPins(), getFlickrPins()]);
+    
+    const interleavedFeed = [];
+    const maxLength = Math.max(cloudinaryFeed.length, lexica.length, flickr.length);
+    
+    // Interleave seamlessly
+    for (let i = 0; i < maxLength; i++) {
+        if (cloudinaryFeed[i]) interleavedFeed.push(cloudinaryFeed[i]);
+        if (lexica[i]) interleavedFeed.push(lexica[i]);
+        if (flickr[i]) interleavedFeed.push(flickr[i]);
+    }
+    
+    if (interleavedFeed.length > 0) {
+        mixedGlobalFeed = interleavedFeed;
+        console.log(`Successfully mixed ${mixedGlobalFeed.length} highly aesthetic pins.`);
+    }
+}
+
+// Initial load, then refresh every 10 minutes
 buildGlobalFeed();
 setInterval(buildGlobalFeed, 10 * 60 * 1000); 
-
-// Clear dead sessions
-setInterval(() => {
-    const now = Date.now();
-    for (const [key, session] of sessionFeeds.entries()) { if (now - session.timestamp > 3600000) sessionFeeds.delete(key); }
-    for (const [key, cache] of searchCache.entries()) { if (now - cache.timestamp > 3600000) searchCache.delete(key); }
-}, 15 * 60 * 1000);
 
 // ==========================================
 // API ROUTES
 // ==========================================
 
-// PERSONALIZED FEED GENERATION
-app.get('/api/pins', async (req, res) => {
+// FAST FEED PAGINATION (For Home Page)
+app.get('/api/pins', (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20; 
-    const sessionId = req.query.sessionId || getClientIp(req);
-    const userInterests = req.query.interests || ""; // Received from frontend local storage!
-
-    // Create a brand new session/feed if they request page 1 (pull-to-refresh) OR they don't have a session.
-    if (page === 1 || !sessionFeeds.has(sessionId)) {
-        let dynamicFeed = [];
-
-        // If the user has a registered Interest Profile, fetch tailored content live!
-        if (userInterests) {
-            const keywords = userInterests.split(',').filter(k => k.trim());
-            // Fetch concurrently to save time
-            const tailoredResults = await Promise.all(
-                keywords.map(async kw => {
-                    const lex = await getLexicaPins(kw);
-                    const fli = await getFlickrPins(kw);
-                    return [...lex, ...fli];
-                })
-            );
-            dynamicFeed = tailoredResults.flat();
-            
-            // Backfill with the global cache if APIs didn't return enough for a full infinite scroll loop
-            if (dynamicFeed.length < 50) {
-                const fallback = shuffleArray(Array.from(globalPinPool.values())).slice(0, 150);
-                dynamicFeed = [...dynamicFeed, ...fallback];
-            }
-        } else {
-            // User is entirely new (no interests). Give them the massive shuffled generic pool.
-            dynamicFeed = shuffleArray(Array.from(globalPinPool.values()));
-        }
-
-        // Deduplicate
-        const uniqueFeedMap = new Map();
-        dynamicFeed.forEach(p => uniqueFeedMap.set(p.id, p));
-        
-        sessionFeeds.set(sessionId, { 
-            feed: shuffleArray(Array.from(uniqueFeedMap.values())), 
-            timestamp: Date.now() 
-        });
-    }
-
-    const sessionData = sessionFeeds.get(sessionId);
-    sessionData.timestamp = Date.now(); 
-
+    
     const startIndex = (page - 1) * limit;
     const endIndex = page * limit;
-    const paginatedPins = sessionData.feed.slice(startIndex, endIndex);
     
     res.json({
-        data: paginatedPins,
+        data: mixedGlobalFeed.slice(startIndex, endIndex),
         currentPage: page,
-        hasMore: endIndex < sessionData.feed.length
+        hasMore: endIndex < mixedGlobalFeed.length
     });
 });
 
+// TRUE GLOBAL SEARCH (Actively searches databases based on user keyword)
 app.get('/api/search', async (req, res) => {
     const query = req.query.q;
-    if (!query) return res.json({ data: [], hasMore: false });
+    if (!query) {
+        return res.json({ data: mixedGlobalFeed.slice(0, 20), hasMore: false });
+    }
 
-    const normalizedQuery = query.toLowerCase().trim();
     try {
-        if (!searchCache.has(normalizedQuery)) {
-            const localMatches = Array.from(globalPinPool.values()).filter(pin => 
-                (pin.title && pin.title.toLowerCase().includes(normalizedQuery)) ||
-                (pin.tags && pin.tags.some(tag => tag.toLowerCase().includes(normalizedQuery)))
-            );
-            const [lexicaMatches, flickrMatches] = await Promise.all([ getLexicaPins(normalizedQuery), getFlickrPins(normalizedQuery) ]);
-            
-            const searchMerge = new Map();
-            [...localMatches, ...lexicaMatches, ...flickrMatches].forEach(pin => searchMerge.set(pin.id, pin));
+        // 1. Search Local Uploads
+        const cloudinaryMatches = cloudinaryFeed.filter(pin => 
+            (pin.title && pin.title.toLowerCase().includes(query.toLowerCase())) ||
+            (pin.tags && pin.tags.some(tag => tag.toLowerCase().includes(query.toLowerCase())))
+        );
 
-            searchCache.set(normalizedQuery, { pins: Array.from(searchMerge.values()), timestamp: Date.now() });
+        // 2. Perform LIVE Search across external databases using the user's exact keyword!
+        const [lexicaMatches, flickrMatches] = await Promise.all([
+            getLexicaPins(query),
+            getFlickrPins(query)
+        ]);
+
+        // Interleave the matching search results
+        const searchResults = [];
+        const maxLength = Math.max(cloudinaryMatches.length, lexicaMatches.length, flickrMatches.length);
+        
+        for (let i = 0; i < maxLength; i++) {
+            if (cloudinaryMatches[i]) searchResults.push(cloudinaryMatches[i]);
+            if (lexicaMatches[i]) searchResults.push(lexicaMatches[i]);
+            if (flickrMatches[i]) searchResults.push(flickrMatches[i]);
         }
 
-        const cacheData = searchCache.get(normalizedQuery);
-        cacheData.timestamp = Date.now(); 
-
-        const shuffledSearchResults = shuffleArray(cacheData.pins);
-        res.json({ data: shuffledSearchResults.slice(0, 40), hasMore: false });
-    } catch (error) { res.status(500).json({ error: "Search failed" }); }
+        res.json({ data: searchResults, hasMore: false });
+    } catch (error) {
+        console.error("Search API Error:", error);
+        res.status(500).json({ error: "Search failed" });
+    }
 });
 
+// CLOUDINARY UPLOAD
 app.post('/api/upload', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: "No image file provided" });
     const title = req.body.title || 'New Pin';
@@ -233,14 +208,19 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
         { folder: "pinterest_feed", context: `title=${title}` },
         (error, result) => {
             if (error) return res.status(500).json({ error: "Upload failed" });
+
             const newPin = {
-                id: result.asset_id, source: 'cloudinary', imageUrl: result.secure_url,
+                id: result.asset_id,
+                imageUrl: result.secure_url,
                 thumbnailUrl: result.secure_url.replace('/upload/', '/upload/w_400,c_scale,q_auto,f_auto/'),
-                title: title, width: result.width || 400, height: result.height || 600
+                title: title,
+                width: result.width || 400,
+                height: result.height || 600
             };
 
-            globalPinPool.set(newPin.id, newPin);
-            for (const session of sessionFeeds.values()) { session.feed.unshift(newPin); }
+            // Inject uploaded pin to the very top immediately
+            cloudinaryFeed.unshift(newPin);
+            mixedGlobalFeed.unshift(newPin); 
             
             io.emit('new_pin', newPin);
             res.status(201).json({ message: "Upload successful", pin: newPin });
@@ -252,7 +232,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     bufferStream.pipe(uploadStream);
 });
 
-app.get('/', (req, res) => res.send("Dynamic Personalized User Engine Running!"));
+app.get('/', (req, res) => res.send("Optimized Backend Running! Lexica.art & True Global Search Active."));
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 
 const PORT = process.env.PORT || 5000;
